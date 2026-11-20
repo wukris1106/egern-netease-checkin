@@ -1,0 +1,51 @@
+name: "网易云音乐签到"
+description: "每日自动签到：积分/经验 + 云贝 + VIP 成长值（黑胶乐签）。Cookie 从 App 请求自动捕获。"
+author: "杨思思"
+icon: "music.note"
+
+compat_arguments:
+  CronExp: "10 0 * * *"
+  ENABLE_CAPTURE: "true"
+  ENABLE_SCHEDULE: "true"
+
+compat_arguments_desc: |
+  CronExp=签到时间（默认每天 00:10）
+  ENABLE_CAPTURE=自动获取 Cookie（true 开 / false 关）
+  ENABLE_SCHEDULE=每日自动签到（true 开 / false 关）
+
+env_schema:
+  ENABLE_CAPTURE:
+    name: "自动获取 Cookie"
+    description: "开启后打开网易云 App 自动保存 Cookie；关闭后不抓 Cookie，签到仍照常"
+    default_value: "true"
+    options: ["true", "false"]
+  ENABLE_SCHEDULE:
+    name: "每日自动签到"
+    description: "关闭后定时任务不执行签到"
+    default_value: "true"
+    options: ["true", "false"]
+
+mitm:
+  hostnames:
+    - music.163.com
+    - interface.music.163.com
+    - interface3.music.163.com
+
+scriptings:
+  - http_request:
+      name: "捕获网易云 Cookie"
+      match: "^https://(interface3|interface)?\\.?music\\.163\\.com/"
+      env:
+        ENABLE_CAPTURE: "{{{ENABLE_CAPTURE}}}"
+      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=16"
+      timeout: 30
+      update_interval: 86400
+
+  - schedule:
+      name: "每日网易云签到"
+      cron: "{{{CronExp}}}"
+      env:
+        ENABLE_SCHEDULE: "{{{ENABLE_SCHEDULE}}}"
+      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=16"
+      timeout: 120
+      update_interval: 86400
