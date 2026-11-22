@@ -1,4 +1,4 @@
-// 网易云音乐签到 · Egern 脚本 v15 (2026-11-20)
+// 网易云音乐签到 · Egern 脚本 v17 (2026-11-23)
 // 三个签到目标：积分/经验、云贝、VIP 成长值（黑胶乐签）
 // 明文 /api/ 路径可用，无需 weapi 加密
 
@@ -146,6 +146,16 @@ async function captureCookie(ctx) {
     }
   }
   console.log(`netease: 捕获 MUSIC_U 成功 len=${cookie.length} changed=${changed}`);
+
+  // MUSIC_U 会随 App 请求轮换，不裁会每次捕获都多一条账号，签到任务天天刷一堆失效提示
+  const ks = Object.keys(accounts);
+  if (ks.length > 3) {
+    ks.sort((a, b) => (accounts[b].updated || 0) - (accounts[a].updated || 0));
+    const trimmed = {};
+    ks.slice(0, 3).forEach((x) => { trimmed[x] = accounts[x]; });
+    ctx.storage.setJSON(KEY_ACCOUNTS, trimmed);
+    console.log(`netease: 账号条目裁剪 ${ks.length} -> 3`);
+  }
 }
 
 async function signOne(ctx, cookie, url, method) {
@@ -199,23 +209,50 @@ async function runScheduled(ctx) {
   const lines = [];
   let okCount = 0;
   let failCount = 0;
+  let deadCount = 0;
   let firstOk = true;
+  const seenUid = {};
+  let changed = false;
 
   for (const k of keys) {
     const acc = accounts[k];
-    if (!acc || !acc.cookie) continue;
+    if (!acc || !acc.cookie) {
+      delete accounts[k];
+      changed = true;
+      continue;
+    }
 
     // 验证登录态 + 取昵称
     const info = parseJSON(await httpRaw(ctx, "GET", ACCOUNT_URL, cookieHeaders(acc.cookie)));
-    if (info._err || info.code !== 200 || !(info.data && info.data.profile)) {
+    if (info._err) {
+      // 网络/解析异常 ≠ Cookie 失效，保留条目等下一轮
       failCount++;
-      lines.push(`${acc.name || k}：Cookie 失效，请重新打开 App 登录`);
+      lines.push(`${acc.name || k}：网络异常，Cookie 已保留（${info._err}）`);
       continue;
     }
-    const name = info.data.profile.nickname || acc.name || k;
+    if (info.code !== 200 || !(info.data && info.data.profile)) {
+      // 真失效：直接删掉。MUSIC_U 会随 App 请求轮换，旧条目留着只会天天刷同一条失败
+      delete accounts[k];
+      changed = true;
+      deadCount++;
+      failCount++;
+      continue;
+    }
+
+    const profile = info.data.profile;
+    const uid = String(profile.userId || "");
+    if (uid && seenUid[uid]) {
+      // 同一账号的重复条目（Cookie 轮换产生的），删掉不重复签到
+      delete accounts[k];
+      changed = true;
+      continue;
+    }
+    if (uid) seenUid[uid] = true;
+
+    const name = profile.nickname || acc.name || k;
     if (acc.name !== name) {
       accounts[k].name = name;
-      ctx.storage.setJSON(KEY_ACCOUNTS, accounts);
+      changed = true;
     }
 
     const parts = [];
@@ -236,7 +273,18 @@ async function runScheduled(ctx) {
     }
   }
 
-  const head = failCount === 0 ? "全部签到成功" : `${okCount}/${okCount + failCount} 成功`;
+  if (changed) ctx.storage.setJSON(KEY_ACCOUNTS, accounts);
+
+  if (deadCount) {
+    lines.push(`已清理 ${deadCount} 个失效 Cookie，打开网易云 App 会自动重新抓取`);
+  }
+  if (!lines.length) {
+    lines.push("没有可用 Cookie：请打开网易云 App 任意页面，或重新登录一次");
+  }
+
+  const head = deadCount && !okCount
+    ? "Cookie 已过期"
+    : (failCount === 0 ? "全部签到成功" : `${okCount}/${okCount + failCount} 成功`);
   const body = head + "\n" + lines.join("\n");
   ctx.storage.setJSON(KEY_LAST_RESULT, { at: Date.now(), ok: okCount, fail: failCount, body: body });
   ctx.notify({ title: "网易云签到", body: body });
