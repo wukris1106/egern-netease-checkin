@@ -1,18 +1,44 @@
-// 网易云音乐签到 · Egern 脚本 v17 (2026-11-23)
+// 网易云音乐签到 · Egern 脚本 v18 (2026-11-24)
 // 三个签到目标：积分/经验、云贝、VIP 成长值（黑胶乐签）
-// 明文 /api/ 路径可用，无需 weapi 加密
-
-const ACCOUNT_URL = "https://music.163.com/api/nuser/account/get";
-const DAILY_URL = "https://music.163.com/api/point/dailyTask?type=0";
-const YUNBEI_URL = "https://music.163.com/api/pointmall/user/sign";
-const VIP_SIGN_URL = "https://music.163.com/api/vip-center-bff/task/sign";
-const VIP_HISTORY_URL = "https://music.163.com/api/vipnewcenter/app/level/user/checkin/history/detail";
-const VIP_REWARD_ALL_URL = "https://music.163.com/api/vipnewcenter/app/level/task/reward/getall";
+// v18 修复：/api/nuser/account/get 的账号信息在 **顶层** profile/account（不在 data 里），
+//           v17 判的是 info.data.profile → 永远为假 → 每天把有效 Cookie 当失效删掉，
+//           所以才会一直收到「Cookie 已过期，已清理 N 个失效 Cookie」。
+//           同时改成：校验失败不立刻删（连续 3 天才删），web / app 两种 Cookie 形态都试。
 
 const KEY_ACCOUNTS = "netease_music_accounts";
 const KEY_CAPTURE_DAY = "netease_music_capture_complete";
 const KEY_LAST_RESULT = "netease_music_last_result";
 const KEY_LAST_CAPTURE = "netease_music_last_capture";
+
+const UA_WEB =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+const UA_APP = "NeteaseMusic/9.1.0 (iPhone; iOS 17.0; Scale/3.00)";
+
+// 两种 Cookie 形态：网页登录的 MUSIC_U 走 music.163.com；App 抓到的走 interface3
+const FLAVORS = {
+  web: {
+    base: "https://music.163.com",
+    headers(cookie) {
+      return {
+        Cookie: cookie,
+        "User-Agent": UA_WEB,
+        Referer: "https://music.163.com/",
+        Accept: "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+      };
+    },
+  },
+  app: {
+    base: "https://interface3.music.163.com",
+    headers(cookie) {
+      return {
+        Cookie: "os=ios; appver=9.1.0; channel=distribution; " + cookie,
+        "User-Agent": UA_APP,
+        Accept: "*/*",
+      };
+    },
+  },
+};
 
 function envEnabled(ctx, key) {
   const raw = String(ctx.env?.[key] ?? "");
@@ -38,9 +64,7 @@ function safeGetJSON(ctx, key, fallback) {
 
 function fp(str) {
   let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = (h * 31 + str.charCodeAt(i)) | 0;
-  }
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
   return String(h >>> 0);
 }
 
@@ -84,7 +108,7 @@ function parseJSON(res) {
   try {
     return JSON.parse(res.text);
   } catch (e) {
-    return { _err: "接口返回非 JSON（可能被风控或需要重新登录）" };
+    return { _err: "接口返回非 JSON（可能被风控）" };
   }
 }
 
@@ -100,29 +124,26 @@ function isDone(data) {
   return /成功|已签到|已签|重复|已领取|已完成|已打卡|明天再来/.test(msg);
 }
 
-function cookieHeaders(cookie) {
-  return {
-    "Cookie": cookie,
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Referer": "https://music.163.com/",
-    "Accept": "*/*",
-  };
+// 关键修复：profile / account 在顶层
+function profileOf(info) {
+  if (!info || typeof info !== "object" || info._err) return null;
+  const p = info.profile || (info.data && info.data.profile) || null;
+  const a = info.account || (info.data && info.data.account) || null;
+  if (p && (p.userId || p.nickname)) return p;
+  if (a && a.id) return { userId: a.id, nickname: (p && p.nickname) || "网易云账号" };
+  return null;
 }
 
 async function captureCookie(ctx) {
   if (!envEnabled(ctx, "ENABLE_CAPTURE")) return;
   const cookie = headerValue(ctx.request?.headers, "cookie");
-  if (!cookie) {
-    console.log("netease: 无 Cookie 头，跳过");
-    return;
-  }
+  if (!cookie) return;
   if (!/MUSIC_U=/.test(cookie)) {
     console.log(`netease: 有 Cookie 但无 MUSIC_U (len=${cookie.length})，跳过`);
     return;
   }
 
   const f = fp(cookie);
-  const last = safeGetJSON(ctx, KEY_LAST_CAPTURE, {});
   const accounts = safeGetJSON(ctx, KEY_ACCOUNTS, {});
   const key = "acc_" + f;
   const changed = !accounts[key] || accounts[key].cookie !== cookie;
@@ -131,6 +152,7 @@ async function captureCookie(ctx) {
     cookie: cookie,
     name: accounts[key]?.name || "网易云账号",
     updated: Date.now(),
+    fail: 0,
   };
   ctx.storage.setJSON(KEY_ACCOUNTS, accounts);
   ctx.storage.setJSON(KEY_LAST_CAPTURE, { f: f });
@@ -147,7 +169,7 @@ async function captureCookie(ctx) {
   }
   console.log(`netease: 捕获 MUSIC_U 成功 len=${cookie.length} changed=${changed}`);
 
-  // MUSIC_U 会随 App 请求轮换，不裁会每次捕获都多一条账号，签到任务天天刷一堆失效提示
+  // MUSIC_U 随 App 请求轮换，只留最新 3 条
   const ks = Object.keys(accounts);
   if (ks.length > 3) {
     ks.sort((a, b) => (accounts[b].updated || 0) - (accounts[a].updated || 0));
@@ -158,36 +180,57 @@ async function captureCookie(ctx) {
   }
 }
 
-async function signOne(ctx, cookie, url, method) {
-  const res = await httpRaw(ctx, method || "POST", url, cookieHeaders(cookie), method === "POST" ? "" : undefined);
-  const data = parseJSON(res);
-  if (data._err) return { ok: false, msg: data._err };
-  const done = isDone(data);
-  return {
-    ok: done,
-    msg: String(data.message || data.msg || (done ? "已完成" : "未知响应")),
-  };
+// 依次尝试 web / app 两种形态，任一拿到 profile 即视为登录态有效
+async function validate(ctx, cookie) {
+  const tried = [];
+  for (const name of ["web", "app"]) {
+    const fl = FLAVORS[name];
+    const info = parseJSON(
+      await httpRaw(ctx, "GET", fl.base + "/api/nuser/account/get", fl.headers(cookie))
+    );
+    if (info._err) {
+      tried.push(`${name}:err(${info._err})`);
+      continue;
+    }
+    const prof = profileOf(info);
+    if (prof) return { ok: true, flavor: name, profile: prof, tried };
+    tried.push(`${name}:${info.code}${info.message ? "/" + info.message : ""}`);
+  }
+  return { ok: false, flavor: null, profile: null, tried };
 }
 
-async function signVipGrowth(ctx, cookie) {
-  const h = cookieHeaders(cookie);
-  // 1. 打卡
-  const signRes = parseJSON(await httpRaw(ctx, "POST", VIP_SIGN_URL, h, ""));
+async function signOne(ctx, cookie, flavor, path, method) {
+  const fl = FLAVORS[flavor] || FLAVORS.web;
+  const headers = { ...fl.headers(cookie), "Content-Type": "application/x-www-form-urlencoded" };
+  const res = await httpRaw(ctx, method || "POST", fl.base + path, headers, method === "POST" ? "" : undefined);
+  const data = parseJSON(res);
+  if (data._err) return { ok: false, msg: data._err };
+  if (data.code === 301 || data.code === 302) return { ok: false, msg: "未登录(301)" };
+  return { ok: isDone(data), msg: String(data.message || data.msg || (isDone(data) ? "已完成" : "未知响应")) };
+}
+
+async function signVipGrowth(ctx, cookie, flavor) {
+  const fl = FLAVORS[flavor] || FLAVORS.web;
+  const h = { ...fl.headers(cookie), "Content-Type": "application/x-www-form-urlencoded" };
+
+  const signRes = parseJSON(await httpRaw(ctx, "POST", fl.base + "/api/vip-center-bff/task/sign", h, ""));
   if (signRes._err) return { ok: false, msg: "打卡失败：" + signRes._err };
-  const signOk = signRes.code === 200 && !isFakeSuccess(signRes.message || signRes.msg);
-  if (!signOk) {
+  if (signRes.code === 301 || signRes.code === 302) return { ok: false, msg: "未登录(301)" };
+  if (!(signRes.code === 200 && !isFakeSuccess(signRes.message || signRes.msg))) {
     return { ok: false, msg: "打卡响应异常：" + String(signRes.message || signRes.msg || "未知") };
   }
-  // 2. 确认打卡记录
-  const body = `signDayTime=${Date.now()}&type=1`;
-  const histRes = parseJSON(await httpRaw(ctx, "POST", VIP_HISTORY_URL, {
-    ...h,
-    "Content-Type": "application/x-www-form-urlencoded",
-  }, body));
+
+  const histRes = parseJSON(await httpRaw(
+    ctx, "POST", fl.base + "/api/vipnewcenter/app/level/user/checkin/history/detail", h,
+    `signDayTime=${Date.now()}&type=1`
+  ));
   const histOk = histRes.code === 200;
-  // 3. 一键领取
-  const rewardRes = parseJSON(await httpRaw(ctx, "POST", VIP_REWARD_ALL_URL, h, ""));
+
+  const rewardRes = parseJSON(await httpRaw(
+    ctx, "POST", fl.base + "/api/vipnewcenter/app/level/task/reward/getall", h, ""
+  ));
   const rewardOk = rewardRes.code === 200 || isDone(rewardRes);
+
   if (histOk && rewardOk) return { ok: true, msg: "打卡+领取成功" };
   if (histOk) return { ok: true, msg: "打卡成功（领取待确认）" };
   return { ok: true, msg: "打卡提交成功" };
@@ -201,7 +244,7 @@ async function runScheduled(ctx) {
   if (!keys.length) {
     ctx.notify({
       title: "网易云签到",
-      body: "没有 Cookie：请先打开网易云 App 任意页面，或重新登录一次",
+      body: "没有 Cookie：请打开网易云 App 任意页面（或重新登录一次）",
     });
     return null;
   }
@@ -210,9 +253,9 @@ async function runScheduled(ctx) {
   let okCount = 0;
   let failCount = 0;
   let deadCount = 0;
-  let firstOk = true;
-  const seenUid = {};
   let changed = false;
+  let firstFailDetail = "";
+  const seenUid = {};
 
   for (const k of keys) {
     const acc = accounts[k];
@@ -222,77 +265,68 @@ async function runScheduled(ctx) {
       continue;
     }
 
-    // 验证登录态 + 取昵称
-    const info = parseJSON(await httpRaw(ctx, "GET", ACCOUNT_URL, cookieHeaders(acc.cookie)));
-    if (info._err) {
-      // 网络/解析异常 ≠ Cookie 失效，保留条目等下一轮
+    const v = await validate(ctx, acc.cookie);
+    if (!v.ok) {
+      // v18：不再立刻删，连续 3 次校验失败才清掉（避免把有效 Cookie 误删成死循环）
+      acc.fail = (acc.fail || 0) + 1;
+      if (acc.fail >= 3) {
+        delete accounts[k];
+        changed = true;
+        deadCount++;
+      } else {
+        changed = true;
+        lines.push(`${acc.name || k}：登录态校验失败，保留待重试（${acc.fail}/3）`);
+      }
       failCount++;
-      lines.push(`${acc.name || k}：网络异常，Cookie 已保留（${info._err}）`);
-      continue;
-    }
-    if (info.code !== 200 || !(info.data && info.data.profile)) {
-      // 真失效：直接删掉。MUSIC_U 会随 App 请求轮换，旧条目留着只会天天刷同一条失败
-      delete accounts[k];
-      changed = true;
-      deadCount++;
-      failCount++;
+      if (!firstFailDetail) firstFailDetail = `校验明细 ${v.tried.join(" | ")}`;
       continue;
     }
 
-    const profile = info.data.profile;
-    const uid = String(profile.userId || "");
+    if (acc.fail) { acc.fail = 0; changed = true; }
+
+    const uid = String(v.profile.userId || "");
     if (uid && seenUid[uid]) {
-      // 同一账号的重复条目（Cookie 轮换产生的），删掉不重复签到
       delete accounts[k];
       changed = true;
       continue;
     }
     if (uid) seenUid[uid] = true;
 
-    const name = profile.nickname || acc.name || k;
-    if (acc.name !== name) {
-      accounts[k].name = name;
-      changed = true;
-    }
+    const name = v.profile.nickname || acc.name || k;
+    if (acc.name !== name) { accounts[k].name = name; changed = true; }
 
+    const flavor = v.flavor;
     const parts = [];
-    const daily = await signOne(ctx, acc.cookie, DAILY_URL, "POST");
+    const daily = await signOne(ctx, acc.cookie, flavor, "/api/point/dailyTask?type=0", "POST");
     parts.push("积分 " + (daily.ok ? "✓" : "✗"));
-    const yunbei = await signOne(ctx, acc.cookie, YUNBEI_URL, "POST");
+    const yunbei = await signOne(ctx, acc.cookie, flavor, "/api/pointmall/user/sign", "POST");
     parts.push("云贝 " + (yunbei.ok ? "✓" : "✗"));
-    const vip = await signVipGrowth(ctx, acc.cookie);
+    const vip = await signVipGrowth(ctx, acc.cookie, flavor);
     parts.push("成长值 " + (vip.ok ? "✓" : "✗"));
 
     const allOk = daily.ok && yunbei.ok && vip.ok;
-    if (allOk) okCount++;
-    else failCount++;
-    lines.push(`${name}：${parts.join(" / ")}`);
-    if (!allOk && firstOk) {
-      lines.push(`  明细 积分:${daily.msg} 云贝:${yunbei.msg} 成长值:${vip.msg}`);
-      firstOk = false;
+    if (allOk) okCount++; else failCount++;
+    lines.push(`${name}：${parts.join(" / ")}（${flavor}）`);
+    if (!allOk && !firstFailDetail) {
+      firstFailDetail = `明细 积分:${daily.msg} 云贝:${yunbei.msg} 成长值:${vip.msg}`;
     }
   }
 
   if (changed) ctx.storage.setJSON(KEY_ACCOUNTS, accounts);
 
-  if (deadCount) {
-    lines.push(`已清理 ${deadCount} 个失效 Cookie，打开网易云 App 会自动重新抓取`);
-  }
-  if (!lines.length) {
-    lines.push("没有可用 Cookie：请打开网易云 App 任意页面，或重新登录一次");
-  }
+  if (deadCount) lines.push(`已清理 ${deadCount} 个连续 3 天校验失败的 Cookie`);
+  if (!lines.length) lines.push("没有可用 Cookie：请打开网易云 App 任意页面，或重新登录一次");
 
   const head = deadCount && !okCount
     ? "Cookie 已过期"
     : (failCount === 0 ? "全部签到成功" : `${okCount}/${okCount + failCount} 成功`);
-  const body = head + "\n" + lines.join("\n");
-  ctx.storage.setJSON(KEY_LAST_RESULT, { at: Date.now(), ok: okCount, fail: failCount, body: body });
-  ctx.notify({ title: "网易云签到", body: body });
+  const body = head + "\n" + lines.join("\n") + (firstFailDetail ? "\n" + firstFailDetail : "");
+  ctx.storage.setJSON(KEY_LAST_RESULT, { at: Date.now(), ok: okCount, fail: failCount, body });
+  ctx.notify({ title: "网易云签到", body });
   return null;
 }
 
 export default async function (ctx) {
-  // 请求钩子（捕获 Cookie）：失败只记日志，绝不通知
   if (ctx.request && ctx.request.url) {
     try {
       await captureCookie(ctx);
@@ -301,7 +335,6 @@ export default async function (ctx) {
     }
     return;
   }
-  // 定时任务：完成/失败才通知
   try {
     return await runScheduled(ctx);
   } catch (e) {

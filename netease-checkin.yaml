@@ -37,7 +37,7 @@ scriptings:
       match: "^https://(interface3|interface)?\\.?music\\.163\\.com/"
       env:
         ENABLE_CAPTURE: "{{{ENABLE_CAPTURE}}}"
-      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=17"
+      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=18"
       timeout: 30
       update_interval: 86400
 
@@ -46,6 +46,6 @@ scriptings:
       cron: "{{{CronExp}}}"
       env:
         ENABLE_SCHEDULE: "{{{ENABLE_SCHEDULE}}}"
-      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=17"
+      script_url: "https://cdn.jsdelivr.net/gh/wukris1106/egern-netease-checkin@main/netease-checkin.js?v=18"
       timeout: 120
       update_interval: 86400
